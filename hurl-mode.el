@@ -687,7 +687,8 @@ Otherwise use the default `hurl-variables-file'."
                )
               )
             )
-          (insert formatted-resp "\n")
+          (insert formatted-resp)
+          (evil-normal-state)
           ))
     ;; something wrong happened with parsing so just output everything
     (error
