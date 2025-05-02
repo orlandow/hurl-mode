@@ -603,7 +603,7 @@ Otherwise use the default `hurl-variables-file'."
              (formatted-resp
               (condition-case nil
                   (with-temp-buffer
-                    (cond ((string-match "Content-Type: application/json" resp-head)
+                    (cond ((string-match "Content-Type: application/\\(\\w+\\+\\)?json" resp-head)
                            (condition-case err
                                (insert (hurl-response--format-json resp))
                              ;; on error i.e if json-mode or json-ts-mode aren't available tries to fall back to jq
