@@ -39,7 +39,6 @@
 (require 'sgml-mode)
 (require 'json-mode nil 'no-error) ;; if json-mode isn't available we'll try to fallback to jq or something
 (require 'json-ts-mode nil 'no-error) ;; optionally require json-ts-mode
-(require 'shell)
 (require 'outline)
 
 (eval-when-compile
@@ -90,7 +89,7 @@
   :group 'hurl-faces)
 
 (defface hurl-mode-filter-face
-  '((t (:inherit font-lock-builtin-face)))
+  '((t (:inherit font-lock-function-call-face)))
   "Face for hurl filters."
   :group 'hurl-faces)
 
@@ -124,10 +123,44 @@
   "Face for templates."
   :group 'hurl-faces)
 
+(defcustom hurl-secrets-file ".secrets.gpg"
+  "Name of secrets file to use in hurl requests.
+
+Format should be NAME=VALUE as specified in hurl's --secret option.
+All variables in here will be sent via the --secret option in hurl.
+
+This file is HIGHLY encouraged to be encrypted.
+Emacs has built in support for handling GPG files.
+
+Other encryption methods will need custom handling.
+TODO: Need a way for users to hook into the request to decrypt secrets file."
+  :type '(string))
+
+(defcustom hurl-variables-file ".hurl-variables"
+  "Name of variables file to automatically use in hurl requests."
+  :type '(string))
+
+(defcustom hurl-mode-use-netrc-file nil
+  "Whether or not to use the --netrc-file option.
+See: `hurl-mode-netrc-file'"
+  :type '(boolean))
+
+(defcustom hurl-mode-netrc-file "~/.netrc"
+  "Location for netrc file for usernams and passwords.
+To be used with the --netrc-file option."
+  :type '(file))
 
 (defcustom hurl-mode-use-json-ts-mode t
   "Whether or not to use `json-ts-mode' for json fontification in response body if applicable."
   :type '(boolean))
+
+(defcustom hurl-use-fast-process-settings t
+  "Whether or not to speed up processes via changing some Emacs vars.
+`read-process-output-max' and `process-adaptive-read-buffering' can be tuned
+to improve process speed.
+Setting this will adjust those settings only for the hurl process we create."
+  :type '(boolean))
+
 
 (defconst hurl-mode--http-method-keywords
   '("GET" "HEAD" "POST" "PUT" "DELETE" "CONNECT" "OPTIONS" "TRACE" "PATCH"))
@@ -140,7 +173,7 @@
   (rx-to-string `(: "{{" (* (or alnum "-" "_")) "}}")))
 
 (defconst hurl-mode--section-header-keywords
-  '("[QueryStringParams]" "[FormParams]" "[MultipartFormData]" "[BasicAuth]" "[Cookies]" "[Asserts]" "[Captures]" "[Options]"))
+  '("[QueryStringParams]" "[Query]" "[FormParams]" "[Form]" "[MultipartFormData]" "[Multipart]" "[BasicAuth]" "[Cookies]" "[Asserts]" "[Captures]" "[Options]"))
 (defconst hurl-mode--section-header-regexp
   (rx-to-string `(: bol
                   (or ,@hurl-mode--section-header-keywords))))
@@ -155,17 +188,28 @@
   '("header" "cookie" "xpath" "jsonpath" "regex" "variable"))
 
 (defconst hurl-mode--no-arg-queries
-  '("status" "url" "body" "duration" "sha256" "md5" "bytes"))
+  '("status" "url" "body" "duration" "sha256" "md5" "bytes" "ip" "version"))
 
 (defconst hurl-mode--certificate-attrs
   '("Subject" "Issuer" "Start-Date" "Expire-Date" "Serial-Number"))
 
+;; See: https://hurl.dev/docs/asserting-response.html#predicates
 (defconst hurl-mode--predicates
-  '("==" "!=" ">" ">=" "<" "<=" "startsWith" "endsWith" "contains" "includes" "matches" "exists" "isBoolean" "isCollection" "isDate" "isEmpty" "isFloat" "isInteger" "isString"))
+  '("==" "!=" ">" ">=" "<" "<="
+    "startsWith" "endsWith" "contains" "includes" "matches" "exists"
+    "isBoolean" "isCollection" "isEmpty"
+    "isDate" "isIsoDate"
+    "isIpv4" "isIpv6"
+    "isNumber" "isFloat" "isInteger"
+    "isString"))
 
+;; Hurl Filter Reference: https://hurl.dev/docs/filters.html
 (defconst hurl-mode--no-arg-filters
-  '("count" "daysAfterNow" "daysBeforeNow" "decode" "format" "htmlEscape" "htmlUnescape" "toDate" "toInt" "urlDecode" "urlEncode"))
-
+  '("base64Decode" "base64Encode" "decode" "urlDecode" "urlEncode"
+    "count" "format"
+    "daysAfterNow" "daysBeforeNow"
+    "htmlEscape" "htmlUnescape"
+    "toDate" "toInt" "toFloat" "toString"))
 (defconst hurl-mode--single-int-arg-filters '("nth"))
 (defconst hurl-mode--single-string-arg-filters '("regex" "split" "xpath"))
 (defconst hurl-mode--double-string-arg-filters `("replace"))
@@ -173,11 +217,19 @@
 
 (defun hurl-fontify-src-blocks (limit)
   "Fontifies body blocks for detected languages.
-Essentially creates a temporary buffer with the specified major mode and inserts the request body text into it.
-Then we can copy the font properties from that temporary buffer to our real hurl buffer.
+Essentially creates a temporary buffer with the specified major
+mode and inserts the request body text into it.
 
-This is basically a simplified version of the combination of `org-fontify-meta-lines-and-blocks-1' and `org-src-font-lock-fontify-block'
-since we don't need to care about the other block types in org."
+Then we can copy the font properties from that
+temporary buffer to our real hurl buffer.
+
+This is basically a simplified version of the combination of
+`org-fontify-meta-lines-and-blocks-1' and `org-src-font-lock-fontify-block'
+since we don't need to care about the other block types in org.
+
+From the elisp docs:
+LIMIT is the limit of the search; it should begin searching at point,
+and not search beyond the limit"
   (when (re-search-forward
          (rx bol (group "```"
                         (group (zero-or-more (any "a-zA-Z")))
@@ -222,16 +274,19 @@ since we don't need to care about the other block types in org."
                     ))
               ;; otherwise if lang not found just fontify with body face
               (add-text-properties block-start block-end `(font-lock-fontified t font-lock-multiline t face hurl-mode-body-face))
-              ()
               )))
-        ;; this t is really important
+        ;; this t is really important to indicate that the match succeeded, or else the match data gets unset.
         ;; see: https://www.gnu.org/software/emacs/manual/html_node/elisp/Search_002dbased-Fontification.html
+        ;; for reference on function based fontification.
         t))))
 
-;; Idea: only match " that doesn't have a \ immediate before it, or the empty string ""
-;; key is using the non greedy *?
 (defconst string-arg-with-escaped-quote
-  `(or (: "\"" (*? (category ascii) ) (not "\\") "\"") (: "\"\"")))
+  `(or (: "\"" (*? (category ascii) ) (not "\\") "\"") (: "\"\""))
+  "Regex to match a string argument.
+Quote followed by ascii terminated by a NON-ESCAPED quote.
+To achieve this, the ascii matching portion MUST BE non-greedy via *?.
+Otherwise, the match never terminates.
+An empty string (no chars in between the quotes) is matched separately.")
 
 (defconst hurl--query-regexp
   `(or (group (or ,@hurl-mode--no-arg-queries))
@@ -240,10 +295,15 @@ since we don't need to care about the other block types in org."
        (: (group "certificate") blank
           (group (or ,@hurl-mode--certificate-attrs))
           ))
-  )
+  "Regex to match queries.
+See: https://hurl.dev/docs/grammar.html#query
+Some do not require any arguments. Some require a single argument.
+Certificate query has a specific set of valid arguments.")
 
 ;; need to go to beginning of line so we can match the other filters with other arg requirements
 (defun hurl--string-arg-filter-matcher ()
+  "Intended to be used as anchored-highlighter fontification for \"filters\".
+See `hurl-variable-and-capture-matcher' for more details."
   (list
    (rx-to-string `(: (group (or ,@hurl-mode--single-string-arg-filters))
                    blank
@@ -256,6 +316,8 @@ since we don't need to care about the other block types in org."
   )
 
 (defun hurl--double-string-arg-filter-matcher ()
+  "Intended to be used as anchored-highlighter fontification for \"filters\".
+See `hurl-variable-and-capture-matcher' for more details."
   (list
    (rx-to-string `(: (group (or ,@hurl-mode--double-string-arg-filters)) blank
                    (group ,string-arg-with-escaped-quote) blank
@@ -269,6 +331,8 @@ since we don't need to care about the other block types in org."
   )
 
 (defun hurl--int-arg-filter-matcher ()
+  "Intended to be used as anchored-highlighter fontification for \"filters\".
+See `hurl-variable-and-capture-matcher' for more details."
   (list
    (rx-to-string `(: (group (or ,@hurl-mode--single-int-arg-filters))
                    blank
@@ -281,6 +345,8 @@ since we don't need to care about the other block types in org."
   )
 
 (defun hurl--no-arg-filter-matcher ()
+  "Intended to be used as anchored-highlighter fontification for \"filters\".
+See `hurl-variable-and-capture-matcher' for more details."
   (list
    (rx-to-string `(: (group (or ,@hurl-mode--no-arg-filters))))
    nil
@@ -289,9 +355,29 @@ since we don't need to care about the other block types in org."
    )
   )
 
-;; anchored highlighter for captures
-;; https://www.gnu.org/software/emacs/manual/html_node/elisp/Search_002dbased-Fontification.html
 (defun hurl-variable-and-capture-matcher ()
+  "Matcher-highlighter fontification for \"captures\".
+
+`hurl--query-regexp' has 5 groups that we can target for font-locking.
+Argumentless queries. (1 group)
+Queries with a single argument. (2 groups)
+Certificate query. (2 groups)
+See: https://hurl.dev/docs/capturing-response.html
+
+We target each with a subexp-highligher.
+
+For Hurl filters however, we use anchored-highlighting.
+In this case, the capture acts as our \"anchor\".
+See: https://hurl.dev/docs/filters.html
+
+All of our anchored-highlighters move to `beginning-of-line' in their POST-FORM.
+We need this to be able to re-anchor on the capture name so that we can
+try subsequent filter matchers.
+
+Hurl grammar reference: https://hurl.dev/docs/grammar.html#capture
+
+Matcher-highlighter, subexp-highlighter and anchored-highlighter reference:
+https://www.gnu.org/software/emacs/manual/html_node/elisp/Search_002dbased-Fontification.html"
   (list
    ;; variable name as anchor
    (rx-to-string `(: bol (group (* (or alnum "_" "-")) ":") blank
@@ -313,6 +399,10 @@ since we don't need to care about the other block types in org."
   )
 
 (defun hurl-assert-matcher ()
+  "Matcher-highlighter fontification for \"asserts\".
+Hurl assert reference: https://hurl.dev/docs/asserting-response.html
+See `hurl-variable-and-capture-matcher' for a more detailed explanation on how
+the fontification is done."
   (list
    (rx-to-string `(: bol ,hurl--query-regexp))
    '(1 'hurl-mode-query-face t t) ;; noarg
@@ -329,10 +419,7 @@ since we don't need to care about the other block types in org."
     nil nil
     '(1 'font-lock-negation-char-face t t)
     '(2 'font-lock-keyword-face t t)
-    '(3 'font-lock-constant-face t t)
-    )
-   )
-  )
+    '(3 'font-lock-constant-face t t))))
 
 (defconst hurl-mode-keywords
   (list
@@ -343,9 +430,7 @@ since we don't need to care about the other block types in org."
    '(hurl-fontify-src-blocks)
    (hurl-variable-and-capture-matcher)
    (hurl-assert-matcher)
-   `(,hurl-mode--template-regexp (0 'hurl-mode-template-face t t))
-   )
-  )
+   `(,hurl-mode--template-regexp (0 'hurl-mode-template-face t t))))
 
 (defconst hurl-mode-syntax-table
   (let ((table (make-syntax-table)))
@@ -356,8 +441,8 @@ since we don't need to care about the other block types in org."
 (defconst hurl-mode-options
   '("aws-sigv4" "cacert" "cert" "color" "compressed" "connect-timeout" "connect-to"
     "continue-on-error" "cookie" "cookie-jar" "delay" "error-format" "file-root"
-    "glob" "http1.0" "http1.1" "http2" "http3" "ignore-asserts" "include" "insecure"
-    "interactive" "ipv4" "ipv6" "json" "key" "location" "location-trusted" "max-redirs"
+    "glob" "header" "http1.0" "http1.1" "http2" "http3" "ignore-asserts" "include" "insecure"
+    "interactive" "ipv4" "ipv6" "json" "key" "limit-rate" "location" "location-trusted" "max-redirs"
     "max-time" "no-color" "no-output" "noproxy" "output" "path-as-is" "proxy"
     "report-html" "report-junit" "report-tap" "resolve" "retry" "retry-interval"
     "ssl-no-revoke" "test" "to-entry" "unix-socket" "user" "user-agent" "variable"
@@ -368,17 +453,25 @@ since we don't need to care about the other block types in org."
   "Return t if inside hurl body block, nil otherwise.
 If point is on the block delimiters themselves, return nil."
   ;;(rx bol (group "```" (group (zero-or-more (any "a-zA-Z"))))))
-  (let ((block-start (save-excursion (re-search-backward "```" nil t) (point)))
-        ;; need the end-of-line here cause we don't want to return true when point is ON the block delimiter
-        (block-end (save-excursion (end-of-line) (re-search-forward "```" nil t) (point)))
-        (prev-req (save-excursion (re-search-backward hurl-mode--http-method-regexp nil t) (point)))
-        (next-req (save-excursion (re-search-forward hurl-mode--http-method-regexp nil t) (point)))
-        )
-    (and (> block-start prev-req) (< block-end next-req))))
+  (condition-case nil
+      (let ((block-start (save-excursion (re-search-backward "```") (point)))
+            ;; need the end-of-line here cause we don't want to return true when point is ON the block delimiter
+            (block-end (save-excursion (end-of-line) (re-search-forward "```") (point)))
+            (prev-req (save-excursion
+                        (condition-case nil
+                            (progn (re-search-backward hurl-mode--http-method-regexp) (point))
+                          (error (point-min)))))
+            (next-req (save-excursion
+                        (condition-case nil
+                            (progn (re-search-forward hurl-mode--http-method-regexp) (point))
+                          (error (point-max))))))
+        (and (> block-start prev-req) (< block-end next-req)))
+    (error nil)))
 
 (defun hurl-indent-line ()
-  "Indent line using `js-indent-line' if we're inside a block. Otherwise do nothing.
-TODO: capture the block lang, and have some mapping of langs to indent functions."
+  "Indent line using `js-indent-line' if we're inside a block.
+Otherwise do nothing."
+  ;; TODO: capture the block lang, and have some mapping of langs to indent functions.
   (if (hurl-inside-block-p)
       (js-indent-line)
     'noindent))
@@ -407,7 +500,8 @@ TODO: capture the block lang, and have some mapping of langs to indent functions
     (sp-local-pair 'hurl-mode "`" nil :actions nil)))
 
 (defun hurl-response-outline-level ()
-  (or 
+  "Hurl response mode `outline-level' function."
+  (or
    (cdr
     (cl-find-if
      (lambda (h)
@@ -417,7 +511,7 @@ TODO: capture the block lang, and have some mapping of langs to indent functions
    (- (match-end 0) (match-beginning 0))))
 
 ;;;###autoload
-(define-derived-mode hurl-response-mode shell-mode "HurlRes"
+(define-derived-mode hurl-response-mode text-mode "HurlRes"
   "Mode for the hurl response buffer.
 `outline-minor-mode' is enabled in this buffer.
 Each hurl request is its own block.
@@ -441,17 +535,6 @@ Each req/resp body is also its own block."
   (setq-local outline-level #'hurl-response-outline-level)
   (outline-minor-mode))
 
-(defcustom hurl-use-fast-process-settings t
-  "Whether or not to spped up processes via changing some emacs vars.
-`read-process-output-max' and `process-adaptive-read-buffering' can be tuned
-to improve process speed.
-Setting this will adjust those settings only for the hurl process we create."
-  :type '(boolean))
-
-(defcustom hurl-variables-file ".hurl-variables"
-  "Name of variables file to automatically use in hurl requests."
-  :type '(string))
-
 (defvar hurl-response--buffer-name "*hurl-response*"
   "Name of output buffer to display to user.")
 
@@ -464,6 +547,7 @@ Setting this will adjust those settings only for the hurl process we create."
 (defconst hurl-mode--temp-file-name ".temp-request.hurl")
 
 (defun hurl-options-completion-at-point ()
+  "Mainly for providing additional options via executing a request with prefix arg."
   (let* ((bds (bounds-of-thing-at-point 'word))
          (start (car bds))
          (end (cdr bds)))
@@ -491,7 +575,7 @@ Prefixes every string with -- for convenience."
 (define-error 'hurl-parse-error "Error parsing hurl response")
 
 (defun hurl--fontify-using-faces (text)
-  "This is for using another major mode's fontification.
+  "This is for using another major mode's fontification on TEXT.
 Reference: https://emacs.stackexchange.com/questions/5400/fontify-a-region-of-a-buffer-with-another-major-mode"
   (let ((pos 0))
     (while (setq next (next-single-property-change pos 'face text))
@@ -501,7 +585,7 @@ Reference: https://emacs.stackexchange.com/questions/5400/fontify-a-region-of-a-
     text))
 
 (defun hurl-response--format-json (json)
-  "Format JSON string keeping json-mode's fontification. Assumes json-mode or json-ts-mode are available."
+  "Format JSON string keeping json-mode's fontification. Assumes `json-mode' or `json-ts-mode' are available."
   (with-temp-buffer
     (erase-buffer)
     (insert json)
@@ -524,7 +608,7 @@ Reference: https://emacs.stackexchange.com/questions/5400/fontify-a-region-of-a-
     (hurl--fontify-using-faces (buffer-string))))
 
 (defun hurl-response--format-json-with-jq (resp)
-  "Format http response using jq.
+  "Format http RESP using jq.
 If not possible, return the resp as is."
   (let* ((jq-command (executable-find "jq" (file-remote-p default-directory)))
          (jq-output
@@ -532,8 +616,9 @@ If not possible, return the resp as is."
             (ansi-color-apply
              (let ((cmd (shell-command-to-string
                          ;; -C to colorize with ansi codes, then we apply using 'ansi-color-apply'
-                         ;; -R reads each line as string instead of JSOn
+                         ;; -R reads each line as string instead of JSON
                          ;; the 'try' lets us output erroneous lines as is, while continuouing to parse the rest
+                         ;; https://stackoverflow.com/questions/41599314/ignore-unparseable-json-with-jq
                          (format "timeout 3 echo %s | %s -C -R '. as $line | try (fromjson) catch $line'"
                                  (shell-quote-argument resp)
                                  jq-command))))
@@ -545,7 +630,7 @@ If not possible, return the resp as is."
   )
 
 (defun hurl-response--format-xml (resp)
-  "Format xml response using `sgml-pretty-print' and keeping sgml mode's fontification"
+  "Format xml RESP using `sgml-pretty-print' and keeping sgml mode's fontification."
   (with-temp-buffer
     (erase-buffer)
     (insert resp)
@@ -576,8 +661,7 @@ Otherwise use the default `hurl-variables-file'."
                                    (progn (re-search-forward "* Response body:") (line-beginning-position)))
                  ;; stuff after response
                  (buffer-substring (progn (re-search-forward "* Timings:") (line-beginning-position))
-                                   (progn (re-search-forward "*$") (line-beginning-position)))))
-                 )
+                                   (progn (re-search-forward "*$") (line-beginning-position))))))
              (resp-head
               (with-current-buffer hurl-response--output-buffer-name
                 (goto-char (point-min))
@@ -644,7 +728,11 @@ Otherwise use the default `hurl-variables-file'."
              (captures (when captures1
                          (cl-map 'list
                                  (lambda (s)
-                                   (split-string s ":"))
+                                   ;; We only want to split on the FIRST :, since for example we can get something like this in the json
+                                   ;; "message": "https://images.dog.ceo/breeds/australian-shepherd/leroy.jpg"
+                                   ;;                  ^ note the colon here in the value
+                                   (let ((splits (split-string s ":")))
+                                     (cons (nth 0 splits) (list (string-join (cdr splits) ":")))))
                                  (seq-filter #'identity
                                              ;; get rid of leading *'s
                                              ;; TODO maybe we extract this part out cause its same code as for resp
@@ -701,40 +789,71 @@ Otherwise use the default `hurl-variables-file'."
   )
 
 (defun hurl-response--verbose-filter (proc str)
+  "Simple process filter for use in `set-process-filter'.
+Just applies ansi color to the STR that come in from the hurl PROC."
   (with-current-buffer (get-buffer-create hurl-response--output-buffer-name)
-    (shell-mode)
-    (insert str)))
+    (insert (ansi-color-apply str))))
+
+
+
+(defun hurl-mode--read-secrets-file ()
+  "Read `hurl-secrets-file' and return a list of secret key value pairs."
+  (with-temp-buffer
+    (when (file-exists-p hurl-secrets-file)
+      (insert-file-contents hurl-secrets-file))
+    (let ((secrets '()))
+      (while (not (eobp))
+        (cl-pushnew (buffer-substring-no-properties (line-beginning-position) (line-end-position)) secrets)
+        (forward-line 1))
+      secrets)))
 
 
 (defun hurl-mode--send-request (&optional args file-name proc-sentinel)
+  "Spawns a process to execute the hurl request.
+`ARGS' are hurl cli arguments.
+This function will always include --very-verbose.
+A prefix arg will prompt for additional args.
+If a `hurl-variables-file' exists, include --variables-file.
+
+If `FILE-NAME' is provided, then use it.
+Otherwise use the current buffer file.
+
+If `PROC-SENTINEL' is provided, then set it for the hurl process."
   (save-buffer) ;; this saves the current hurl file
   (let* ((args (concat args
-                      " --very-verbose"
-                      (when current-prefix-arg
-                        (hurl--read-args))
-                      (when (file-exists-p hurl-variables-file)
-                        (concat " --variables-file " hurl-variables-file))))
-        (cmd (concat "hurl" " " args " " (if file-name file-name (buffer-file-name)))))
-
-    (message "executing hurl cmd: %s" cmd)
+                       " --very-verbose"
+                       (when hurl-mode-use-netrc-file
+                         (concat " --netrc-file " hurl-mode-netrc-file))
+                       (mapconcat
+                        (lambda (secret) (concat " --secret " secret))
+                        (hurl-mode--read-secrets-file))
+                       (when current-prefix-arg
+                         (hurl--read-args))
+                       (when (file-exists-p hurl-variables-file)
+                         (concat " --variables-file " hurl-variables-file))))
+         (cmd (concat "hurl" " " args " " (if file-name file-name (buffer-file-name)))))
     (ignore-errors (kill-buffer hurl-response--output-buffer-name))
     (get-buffer-create hurl-response--output-buffer-name)
     (when-let ((buf (get-buffer hurl-response--process-buffer-name))) (kill-buffer buf))
-    ;; https://stackoverflow.com/questions/41599314/ignore-unparseable-json-with-jq
     (let* ((read-process-output-max (if hurl-use-fast-process-settings (* 64 1024 1024) read-process-output-max))
            (process-adaptive-read-buffering (if hurl-use-fast-process-settings nil process-adaptive-read-buffering))
            (proc (start-file-process "hurl" (get-buffer-create hurl-response--process-buffer-name)
                                      "/bin/sh" "-c" cmd))
            (proc-buffer (process-buffer proc)))
 
+      (with-current-buffer proc-buffer
+        (when hurl-use-fast-process-settings
+          (setq-local read-process-output-max (* 64 1024 1024)
+                      process-adaptive-read-buffering nil)))
+
       (when proc-sentinel
         (set-process-sentinel proc proc-sentinel))
-        (set-process-filter proc #'hurl-response--verbose-filter))))
+      (set-process-filter proc #'hurl-response--verbose-filter))))
 
 
 (defun hurl-mode-send-request-single (arg)
   "Simple thin wrapper which sends the request at point to hurl.
-With prefix arg, prompts for additional arguments to send to hurl."
+With prefix ARG, prompts for additional arguments to send to hurl."
   (interactive "P")
   (let* ((beg (save-excursion
                 (forward-line)
@@ -750,38 +869,38 @@ With prefix arg, prompts for additional arguments to send to hurl."
     (hurl-mode--send-request
      nil hurl-mode--temp-file-name
      (lambda (p e) (when (not (process-live-p p))
-                (with-current-buffer (get-buffer-create hurl-response--output-buffer-name)
-                  (ansi-color-apply-on-region (point-min) (point-max)))
-                (with-current-buffer hurl-response--output-buffer-name
-                  (hurl-response--parse-and-filter-output))
-                (display-buffer hurl-response--buffer-name)
-                (delete-file hurl-mode--temp-file-name))))))
+                     (with-current-buffer (get-buffer-create hurl-response--output-buffer-name)
+                       (ansi-color-apply-on-region (point-min) (point-max)))
+                     (with-current-buffer hurl-response--output-buffer-name
+                       (hurl-response--parse-and-filter-output))
+                     (display-buffer hurl-response--buffer-name)
+                     (delete-file hurl-mode--temp-file-name))))))
 
 (defun hurl-mode-send-request-file (arg)
   "Simple thin wrapper which sends the contents of the current file to hurl.
-With prefix arg, prompts for additional arguments to send to hurl."
+With prefix ARG, prompts for additional arguments to send to hurl."
   (interactive "P")
   (write-region (point-min) (point-max) hurl-mode--temp-file-name)
   (hurl-mode--send-request nil hurl-mode--temp-file-name
                            (lambda (p e) (when (not (process-live-p p))
-                                      (hurl-response--parse-and-filter-output)
-                                      (with-current-buffer hurl-response--output-buffer-name
-                                        (ansi-color-apply-on-region (point-min) (point-max)))
-                                      (display-buffer hurl-response--buffer-name)
-                                      (delete-file hurl-mode--temp-file-name)))
+                                           (hurl-response--parse-and-filter-output)
+                                           (with-current-buffer hurl-response--output-buffer-name
+                                             (ansi-color-apply-on-region (point-min) (point-max)))
+                                           (display-buffer hurl-response--buffer-name)
+                                           (delete-file hurl-mode--temp-file-name)))
                            ))
 
 
 (defun hurl-mode-test-request-file (arg)
   "Hurl wrapper function to send file for testing.
-With prefix arg, prompts for additional arguments to send to hurl."
+With prefix ARG, prompts for additional arguments to send to hurl."
   (interactive "P")
   (hurl-mode--send-request "--test")
   )
 
 (defun hurl-mode-test-request-single (arg)
   "Hurl wrapper function to send the request at point for testing.
-With prefix arg, prompts for additional arguments to send to hurl."
+With prefix ARG, prompts for additional arguments to send to hurl."
   (interactive "P")
   (hurl-mode--send-request "--test")
   )
@@ -790,7 +909,7 @@ With prefix arg, prompts for additional arguments to send to hurl."
       (let ((map (make-sparse-keymap)))
         (define-key map (kbd "C-c T") 'hurl-mode-test-request-file)
         (define-key map (kbd "C-c t") 'hurl-mode-test-request-single)
-        
+
         (define-key map (kbd "C-c X") 'hurl-mode-send-request-file)
         (define-key map (kbd "C-c x") 'hurl-mode-send-request-single)
         map))
@@ -800,16 +919,19 @@ With prefix arg, prompts for additional arguments to send to hurl."
         (define-key map (kbd "q") #'quit-window)
         (define-key map (kbd "TAB") #'outline-toggle-children)
         (define-key map (kbd "<tab>") #'outline-toggle-children)
-        
+
         (define-key map (kbd "S-TAB") #'outline-cycle-buffer)
         (define-key map (kbd "S-<tab>") #'outline-cycle-buffer)
 
         (define-key map (kbd "C-c ]") #'outline-next-heading)
         (define-key map (kbd "C-c >") #'outline-next-heading)
-        
+
         (define-key map (kbd "C-c [") #'outline-previous-heading)
         (define-key map (kbd "C-c <") #'outline-previous-heading)
         map))
 
 (provide 'hurl-mode)
 ;;; hurl-mode.el ends here
+;; Local Variables:
+;; byte-compile-warnings: (not docstrings docstrings-wide)
+;; End:
